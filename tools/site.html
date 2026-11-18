@@ -1,0 +1,605 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"></head><body><title>Cage Legacy</title>
+<link rel="icon" type="image/png" href="game/index.icon.png">
+<style>
+/* One full-window canvas; a loading card sits over it until the engine starts. Deliberately dark only. */
+:root {
+  --bg: #0b0c10;
+  --card: #15171d;
+  --line: #2a2d36;
+  --fg: #e7e4dc;
+  --muted: #9a978f;
+  --accent: #c8452f;
+  --good: #7fb27a;
+  --bad: #e0675a;
+  --font: "Barlow", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --display: "Barlow Condensed", "Arial Narrow", system-ui, sans-serif;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font); overflow: hidden; touch-action: none; }
+#canvas { display: block; width: 100%; height: 100%; outline: none; }
+#loader {
+  position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.card { width: min(420px, 100%); display: grid; gap: 14px; }
+.eyebrow { font-family: var(--display); letter-spacing: 0.18em; text-transform: uppercase; font-size: 13px; color: var(--accent); margin: 0; }
+h1 { font-family: var(--display); font-weight: 700; font-size: 44px; line-height: 1; margin: 0; letter-spacing: 0.01em; text-wrap: balance; }
+.step { margin: 0; color: var(--muted); font-size: 15px; font-variant-numeric: tabular-nums; min-height: 1.4em; }
+.bar { height: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.2s linear; }
+.note { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.err { margin: 0; color: var(--bad); font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+/* Save status: a small pill over the game, bottom left; never takes clicks. */
+#save {
+  position: fixed; left: max(12px, env(safe-area-inset-left, 0px)); bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  max-width: calc(100% - 24px); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--card) 92%, transparent); color: var(--muted);
+  font-size: 12px; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.3s; z-index: 10;
+}
+#save.on { opacity: 1; }
+#save.ok { color: var(--good); }
+#save.bad { color: var(--bad); }
+@media (prefers-reduced-motion: reduce) { .bar > i, #save { transition: none; } }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500&family=Barlow+Condensed:wght@700&display=swap">
+
+<canvas id="canvas" tabindex="0">Your browser does not support the canvas tag.</canvas>
+<div id="loader">
+  <div class="card">
+    <p class="eyebrow">MMA career simulator</p>
+    <h1>Cage Legacy</h1>
+    <p class="step" id="step">Starting…</p>
+    <div class="bar"><i id="fill"></i></div>
+    <p class="err" id="err" hidden></p>
+    <p class="note">About 55 MB downloads the first time. Your careers are saved in this browser.</p>
+  </div>
+</div>
+<div id="save" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  const step = document.getElementById('step');
+  const fill = document.getElementById('fill');
+  const errBox = document.getElementById('err');
+  const saveBox = document.getElementById('save');
+  // Gzipped pieces, named .wasm only so the host will serve them; they are read as raw bytes.
+  const PCK_PARTS = __PCK_PARTS__;
+  const WASM_PART = 'game/wasm.gz.wasm';
+  const TOTAL = __TOTAL__;
+  // Godot keeps user:// in an IndexedDB database named after this folder, one store of files.
+  const USERFS = '/userfs';
+  const FILE_STORE = 'FILE_DATA';
+  const IDB_VERSION = 21;
+  // The save backup is gzip in base64 text; each stored piece stays under the 20 MiB file limit.
+  const PIECE = 15 * 1024 * 1024;
+  const SAVE_DOC = 'saves/latest';
+  let loaded = 0;
+
+  function fail(e) {
+    console.error(e);
+    step.textContent = 'The game could not start.';
+    errBox.textContent = (e && e.message) ? e.message : String(e);
+    errBox.hidden = false;
+  }
+
+  function show() {
+    const pct = Math.min(100, (loaded / TOTAL) * 100);
+    fill.style.width = pct.toFixed(1) + '%';
+    step.textContent = 'Downloading the game: ' + (loaded / 1048576).toFixed(1) + ' of ' + (TOTAL / 1048576).toFixed(1) + ' MB';
+  }
+
+  let saveTimer = null;
+  function saveStatus(text, kind, stay) {
+    clearTimeout(saveTimer);
+    saveBox.textContent = text;
+    saveBox.className = 'on' + (kind ? ' ' + kind : '');
+    if (!stay) saveTimer = setTimeout(() => { saveBox.className = ''; }, 3500);
+  }
+
+  async function download(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Could not download ' + url + ' (HTTP ' + res.status + ').');
+    const reader = res.body.getReader();
+    const chunks = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.length;
+      show();
+    }
+    return new Blob(chunks);
+  }
+
+  async function gunzip(blob) {
+    return new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).blob();
+  }
+
+  async function gzip(blob) {
+    return new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+  }
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Could not load ' + src + '.'));
+      document.head.appendChild(s);
+    });
+  }
+
+  function toBase64(u8) {
+    let s = '';
+    for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+
+  function fromBase64(text) {
+    const bin = atob(text);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  }
+
+  // ---- An in-memory IndexedDB, holding only what Godot's file sync uses. ----
+  // The game's saves live here while it runs; Claude's servers keep the copy that lasts.
+  function copyEntry(v) {
+    if (!v || typeof v !== 'object') return v;
+    const out = {};
+    for (const k in v) {
+      const x = v[k];
+      out[k] = x instanceof Date ? new Date(x.getTime()) : ArrayBuffer.isView(x) ? x.slice() : x;
+    }
+    return out;
+  }
+
+  function makeMemoryIDB() {
+    const dbs = new Map(); // name -> { version, stores: Map(name -> { records: Map, indexes: Set }) }
+    const later = (fn) => setTimeout(fn, 0);
+    const api = { onWrite: null };
+
+    function fire(target, type, extra) {
+      const h = target['on' + type];
+      if (h) h(Object.assign({ target, type, preventDefault() {}, stopPropagation() {} }, extra));
+    }
+
+    function Request(tx) { this.result = undefined; this.error = null; this.transaction = tx; this.onsuccess = null; this.onerror = null; }
+
+    function Transaction(db, mode) {
+      this.db = db; this.mode = mode; this.pending = 0; this.wrote = false; this.finished = false;
+      this.oncomplete = null; this.onerror = null; this.onabort = null;
+    }
+    Transaction.prototype.objectStore = function (name) {
+      const s = this.db._data.stores.get(name);
+      if (!s) throw new DOMException('No object store named ' + name, 'NotFoundError');
+      return new Store(this, s);
+    };
+    Transaction.prototype._run = function (work) {
+      const req = new Request(this);
+      this.pending++;
+      later(() => {
+        try {
+          req.result = work();
+        } catch (e) {
+          req.error = e;
+          this.pending--;
+          fire(req, 'error');
+          fire(this, 'error', { target: req });
+          this._settle();
+          return;
+        }
+        this.pending--;
+        fire(req, 'success');
+        this._settle();
+      });
+      return req;
+    };
+    Transaction.prototype._settle = function () {
+      later(() => {
+        if (this.pending || this.finished) return;
+        this.finished = true;
+        fire(this, 'complete');
+        if (this.wrote && api.onWrite) api.onWrite();
+      });
+    };
+
+    function Store(tx, s) {
+      this.tx = tx; this.s = s;
+      this.indexNames = { contains: (n) => s.indexes.has(n) };
+    }
+    Store.prototype.createIndex = function (name) { this.s.indexes.add(name); return new Index(this.tx, this.s, name); };
+    Store.prototype.index = function (name) { return new Index(this.tx, this.s, name); };
+    Store.prototype.get = function (key) { const recs = this.s.records; return this.tx._run(() => copyEntry(recs.get(key))); };
+    Store.prototype.put = function (value, key) {
+      const recs = this.s.records, v = copyEntry(value);
+      this.tx.wrote = true;
+      return this.tx._run(() => { recs.set(key, v); return key; });
+    };
+    Store.prototype.delete = function (key) {
+      const recs = this.s.records;
+      this.tx.wrote = true;
+      return this.tx._run(() => { recs.delete(key); });
+    };
+
+    function Index(tx, s, field) { this.tx = tx; this.s = s; this.field = field; }
+    Index.prototype.openKeyCursor = function () {
+      const tx = this.tx, recs = this.s.records, field = this.field;
+      const keys = Array.from(recs.keys());
+      const req = new Request(tx);
+      let i = 0;
+      tx.pending++;
+      const next = () => later(() => {
+        while (i < keys.length && !recs.has(keys[i])) i++;
+        if (i < keys.length) {
+          const k = keys[i++];
+          req.result = { primaryKey: k, key: copyEntry({ v: recs.get(k)[field] }).v, continue: next };
+          fire(req, 'success');
+        } else {
+          req.result = null;
+          tx.pending--;
+          fire(req, 'success');
+          tx._settle();
+        }
+      });
+      next();
+      return req;
+    };
+
+    function Database(name, data) {
+      this.name = name; this._data = data; this.version = data.version;
+      this.objectStoreNames = { contains: (n) => data.stores.has(n) };
+    }
+    Database.prototype.createObjectStore = function (name) {
+      const s = { records: new Map(), indexes: new Set() };
+      this._data.stores.set(name, s);
+      return new Store(this._versionTx, s);
+    };
+    Database.prototype.transaction = function (names, mode) {
+      const tx = new Transaction(this, mode || 'readonly');
+      tx._settle();
+      return tx;
+    };
+    Database.prototype.close = function () {};
+
+    api.factory = {
+      open(name, version) {
+        const req = new Request(null);
+        later(() => {
+          let data = dbs.get(name);
+          if (!data) { data = { version: 0, stores: new Map() }; dbs.set(name, data); }
+          const db = new Database(name, data);
+          req.result = db;
+          if (version && version > data.version) {
+            const old = data.version;
+            data.version = db.version = version;
+            const tx = new Transaction(db, 'versionchange');
+            db._versionTx = req.transaction = tx;
+            fire(req, 'upgradeneeded', { oldVersion: old, newVersion: version });
+            req.transaction = null;
+          }
+          fire(req, 'success');
+        });
+        return req;
+      },
+      deleteDatabase(name) {
+        const req = new Request(null);
+        later(() => { dbs.delete(name); fire(req, 'success'); });
+        return req;
+      },
+    };
+
+    // Godot's files, as [path, entry] pairs.
+    api.entries = function () {
+      const s = dbs.get(USERFS) && dbs.get(USERFS).stores.get(FILE_STORE);
+      return s ? Array.from(s.records.entries()) : [];
+    };
+    api.seed = function (entries) {
+      const records = new Map();
+      for (const [k, v] of entries) records.set(k, copyEntry(v));
+      dbs.set(USERFS, { version: IDB_VERSION, stores: new Map([[FILE_STORE, { records, indexes: new Set(['timestamp']) }]]) });
+    };
+    return api;
+  }
+
+  // ---- Turning Godot's files into stored pieces, and back. ----
+  // Caches the game rebuilds by itself are left out of the backup.
+  const SKIP = /\/(portraits|shader_cache|captures)(\/|$)/;
+  // Files this big (career saves) are stored on their own and reused while unchanged; the rest share one bundle.
+  const BIG = 512 * 1024;
+
+  function backedUp(entries) { return entries.filter(([p]) => !SKIP.test(p)); }
+
+  function signature(entries) {
+    return backedUp(entries).map(([p, e]) => p + ':' + (e.timestamp ? e.timestamp.getTime() : 0) + ':' + (e.contents ? e.contents.length : -1)).sort().join('|');
+  }
+
+  async function hashOf(u8) {
+    const d = new Uint8Array(await crypto.subtle.digest('SHA-256', u8));
+    return Array.from(d, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function packBundle(entries) {
+    const files = [];
+    const parts = [];
+    let offset = 0;
+    for (const [p, e] of entries) {
+      const f = { p, m: e.mode, t: e.timestamp ? e.timestamp.getTime() : 0 };
+      if (e.contents) { f.o = offset; f.l = e.contents.length; parts.push(e.contents); offset += f.l; }
+      files.push(f);
+    }
+    const head = new TextEncoder().encode(JSON.stringify({ v: 1, files }));
+    const len = new Uint8Array(4);
+    new DataView(len.buffer).setUint32(0, head.length);
+    return toBase64(new Uint8Array(await gzip(new Blob([len, head].concat(parts)))));
+  }
+
+  async function unpackBundle(text) {
+    const raw = new Uint8Array(await (await gunzip(new Blob([fromBase64(text)]))).arrayBuffer());
+    const headLen = new DataView(raw.buffer, raw.byteOffset).getUint32(0);
+    const head = JSON.parse(new TextDecoder().decode(raw.subarray(4, 4 + headLen)));
+    const base = 4 + headLen;
+    return head.files.map((f) => {
+      const e = { timestamp: new Date(f.t), mode: f.m };
+      if (f.l !== undefined) e.contents = raw.slice(base + f.o, base + f.o + f.l);
+      return [f.p, e];
+    });
+  }
+
+  async function fetchPieces(ids) {
+    const texts = await Promise.all(ids.map(async (id) => {
+      const res = await fetch('/_blob/' + id);
+      if (!res.ok) throw new Error('Save piece ' + id + ' answered HTTP ' + res.status);
+      return res.text();
+    }));
+    return texts.join('');
+  }
+
+  // One snapshot: { savedAt, bundle: [ids], big: [{ p, m, t, h, l, ids }] }.
+  async function readSnapshot(snap) {
+    const entries = await unpackBundle(await fetchPieces(snap.bundle));
+    for (const b of snap.big || []) {
+      const contents = fromBase64(await fetchPieces(b.ids));
+      if (contents.length !== b.l) throw new Error('Save file ' + b.p + ' came back the wrong size');
+      entries.push([b.p, { timestamp: new Date(b.t), mode: b.m, contents }]);
+    }
+    return entries;
+  }
+
+  function idsOf(snap) {
+    if (!snap) return [];
+    return snap.bundle.concat(...(snap.big || []).map((b) => b.ids));
+  }
+
+  // Returns { meta, entries } or throws if the save could not be read (so nothing overwrites it).
+  async function readCloud(cloud) {
+    let snap;
+    try { snap = await cloud.doc.get(); } catch (e) {
+      if (e && e.code === 'unavailable') { await new Promise((r) => setTimeout(r, 800 + Math.random() * 800)); snap = await cloud.doc.get(); } else throw e;
+    }
+    if (!snap.exists) return { meta: null, entries: null };
+    const meta = snap.data();
+    try {
+      return { meta, entries: await readSnapshot(meta.current), savedAt: meta.current.savedAt };
+    } catch (e) {
+      if (!meta.previous) throw e;
+      console.warn('Latest save unreadable, using the one before it', e);
+      return { meta, entries: await readSnapshot(meta.previous), savedAt: meta.previous.savedAt };
+    }
+  }
+
+  // ---- Claude's storage for this page: a database row pointing at the stored backup. ----
+  async function connectCloud() {
+    for (let i = 0; i < 30 && !(window.claude && typeof window.claude.use === 'function'); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!(window.claude && typeof window.claude.use === 'function')) return null;
+    try {
+      const [db, assets] = await Promise.all([window.claude.use('db'), window.claude.use('assets')]);
+      if (!db || !assets) return null;
+      return { db, assets, doc: db.doc(SAVE_DOC) };
+    } catch (e) {
+      console.warn('Claude storage unavailable', e);
+      return null;
+    }
+  }
+
+
+  // Saves kept in this browser before cloud saving existed, if the browser still has them.
+  function readBrowserSaves(realIDB) {
+    return new Promise((resolve) => {
+      try {
+        if (!realIDB) return resolve([]);
+        const req = realIDB.open(USERFS);
+        req.onsuccess = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(FILE_STORE)) { db.close(); return resolve([]); }
+          const out = [];
+          const cur = db.transaction([FILE_STORE], 'readonly').objectStore(FILE_STORE).openCursor();
+          cur.onsuccess = () => {
+            const c = cur.result;
+            if (c) { out.push([c.primaryKey, c.value]); c.continue(); } else { db.close(); resolve(out); }
+          };
+          cur.onerror = () => { db.close(); resolve([]); };
+        };
+        req.onerror = () => resolve([]);
+        req.onblocked = () => resolve([]);
+      } catch (e) {
+        resolve([]);
+      }
+    });
+  }
+
+  function savedAtText(iso) {
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  }
+
+
+  function countFiles(entries) { return backedUp(entries).filter(([, e]) => e.contents).length; }
+
+  async function uploadText(cloud, text, uploaded) {
+    const ids = [];
+    for (let i = 0; i < text.length; i += PIECE) {
+      const up = await cloud.assets.upload(new Blob([text.slice(i, i + PIECE)], { type: 'text/plain' }), { type: 'text/plain' });
+      uploaded.push(up.id);
+      ids.push(up.id);
+    }
+    return ids;
+  }
+
+  const SAVE_ERRORS = {
+    quota_or_state: 'Claude storage for this page is full',
+    rate_limited: 'saving too often',
+    upstream_auth: 'signed out of Claude',
+    not_granted: 'saving is not allowed for this view',
+  };
+
+  // Back up after the game writes, a few seconds after it goes quiet; only changed big files are uploaded.
+  function startBackups(cloud, mem, meta, restored) {
+    let doc = meta;
+    let lastSig = restored ? signature(restored) : '';
+    let dirty = false, running = false, timer = null, lastRun = 0;
+
+    function schedule(ms) { clearTimeout(timer); timer = setTimeout(run, ms); }
+
+    async function run() {
+      timer = null;
+      if (running || !dirty) return;
+      running = true; dirty = false; lastRun = Date.now();
+      const uploaded = [];
+      try {
+        const entries = backedUp(mem.entries());
+        const sig = signature(entries);
+        if (sig === lastSig) return;
+        const known = new Map();
+        for (const s of [doc && doc.previous, doc && doc.current]) for (const b of (s && s.big) || []) known.set(b.h, b.ids);
+        const small = [], big = [];
+        let sent = 0;
+        for (const [p, e] of entries) {
+          if (!(e.contents && e.contents.length >= BIG)) { small.push([p, e]); continue; }
+          const h = await hashOf(e.contents);
+          let ids = known.get(h);
+          if (!ids) {
+            if (!sent) saveStatus('Saving to Claude…', '', true);
+            ids = await uploadText(cloud, toBase64(e.contents), uploaded);
+            sent++;
+            known.set(h, ids);
+          }
+          big.push({ p, m: e.mode, t: e.timestamp ? e.timestamp.getTime() : 0, h, l: e.contents.length, ids });
+        }
+        const bundle = await uploadText(cloud, await packBundle(small), uploaded);
+        const current = { savedAt: new Date().toISOString(), bundle, big, files: countFiles(entries) };
+        const next = { v: 2, current, previous: doc ? doc.current : null };
+        await cloud.doc.set(next);
+        const keep = new Set(idsOf(next.current).concat(idsOf(next.previous)));
+        const stale = doc ? idsOf(doc.previous) : [];
+        doc = next;
+        lastSig = sig;
+        for (const id of new Set(stale)) if (!keep.has(id)) cloud.assets.delete(id).catch(() => {});
+        saveStatus('Saved to Claude', 'ok');
+      } catch (e) {
+        console.error('Cloud save failed', e);
+        for (const id of uploaded) cloud.assets.delete(id).catch(() => {});
+        dirty = true;
+        const why = e && (SAVE_ERRORS[e.code] || e.code || e.message);
+        saveStatus('Could not save to Claude' + (why ? ' (' + why + ')' : '') + '. Trying again in a minute.', 'bad', true);
+        schedule(60000);
+      } finally {
+        running = false;
+        if (dirty && !timer) schedule(4000);
+      }
+    }
+
+    mem.onWrite = () => {
+      dirty = true;
+      if (!running) schedule(Math.max(4000, 15000 - (Date.now() - lastRun)));
+    };
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden' && dirty && !running) run();
+    });
+    return { now() { dirty = true; schedule(0); } };
+  }
+
+  async function main() {
+    if (typeof DecompressionStream === 'undefined' || typeof CompressionStream === 'undefined') {
+      throw new Error('This browser is too old to unpack the game. Use a current Edge, Chrome or Firefox.');
+    }
+    show();
+    const cloudReady = connectCloud();
+    // Download the wasm and the four pack pieces together, and read the save meanwhile.
+    const gameParts = Promise.all([download(WASM_PART), ...PCK_PARTS.map(download)]);
+    const cloud = await cloudReady;
+    let saved = null, cloudError = null;
+    if (cloud) {
+      try { saved = await readCloud(cloud); } catch (e) { cloudError = e; console.error('Could not read the save', e); }
+    }
+    const [wasmGz, ...pckGz] = await gameParts;
+    step.textContent = 'Unpacking…';
+    const [wasm, pck] = await Promise.all([gunzip(wasmGz), gunzip(new Blob(pckGz))]);
+
+    // Saves: when Claude's storage answered, the game's files live in memory and are backed up there.
+    let backups = null, restoredFrom = null, migrated = false;
+    if (cloud && saved) {
+      let realIDB = null;
+      try { realIDB = window.indexedDB; } catch (e) { realIDB = null; }
+      const mem = makeMemoryIDB();
+      let entries = saved.entries;
+      if (!entries) {
+        entries = await readBrowserSaves(realIDB);
+        migrated = countFiles(entries) > 0;
+      } else {
+        restoredFrom = saved.savedAt;
+      }
+      mem.seed(entries);
+      Object.defineProperty(window, 'indexedDB', { value: mem.factory, configurable: true });
+      backups = startBackups(cloud, mem, saved.meta, migrated ? null : entries);
+    }
+
+    // Godot fetches game/index.wasm and game/index.pck: hand it the unpacked files instead.
+    const files = {
+      'index.wasm': { blob: wasm, type: 'application/wasm' },
+      'index.pck': { blob: pck, type: 'application/octet-stream' },
+    };
+    const realFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const name = url.split('?')[0].split('/').pop();
+      const f = files[name];
+      if (f) {
+        return Promise.resolve(new Response(f.blob, { status: 200, headers: { 'Content-Type': f.type, 'Content-Length': String(f.blob.size) } }));
+      }
+      return realFetch(input, init);
+    };
+
+    step.textContent = 'Starting the engine…';
+    await loadScript('game/index.js');
+    const config = {
+      // --developer-tools opens Dev Tools, which the career screen's CHEATS button goes to.
+      args: ['--', '--developer-tools'], canvasResizePolicy: 2, emscriptenPoolSize: 8, ensureCrossOriginIsolationHeaders: false,
+      executable: 'game/index', experimentalVK: false,
+      fileSizes: { 'game/index.pck': pck.size, 'game/index.wasm': wasm.size },
+      focusCanvas: true, gdextensionLibs: [], godotPoolSize: 4,
+    };
+    const missing = Engine.getMissingFeatures({ threads: false });
+    if (missing.length) throw new Error('This browser is missing: ' + missing.join(', '));
+    const engine = new Engine(config);
+    await engine.startGame({});
+    document.getElementById('loader').remove();
+
+    if (backups) {
+      if (migrated) { saveStatus('Copying your saves from this browser to Claude…'); backups.now(); }
+      else if (restoredFrom) saveStatus('Saves loaded from Claude (last saved ' + savedAtText(restoredFrom) + ')', 'ok');
+      else saveStatus('Saves will be kept on Claude', 'ok');
+    } else if (cloudError) {
+      saveStatus('Could not load your Claude save. Reload before playing, or progress made now will not be kept.', 'bad', true);
+    } else {
+      /* A normal website: the game saves in this browser by itself. */
+    }
+  }
+
+  main().catch(fail);
+}());
+</script>
+</body></html>

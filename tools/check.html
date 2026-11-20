@@ -14,6 +14,9 @@ p { color: var(--muted); margin: 0 0 16px; }
 table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); }
 th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; }
+button { font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+td.inside { color: var(--muted); font-size: 13px; }
 td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ok { color: var(--good); } .bad { color: var(--bad); }
 .wrap { overflow-x: auto; }
@@ -24,10 +27,62 @@ code { font-size: 12px; word-break: break-all; }
 <main>
 <h1>Save check</h1>
 <p>What Cage Legacy has saved in this browser, and whether each file is whole. This page only reads: it changes nothing. Take a screenshot of it.</p>
+<p><button id="all" type="button" disabled>Look inside every save</button> <span id="busy"></span></p>
 <div class="wrap"><table><thead><tr><th>File</th><th>Size</th><th>Saved</th><th>State</th></tr></thead><tbody id="rows"><tr><td colspan="4">Reading…</td></tr></tbody></table></div>
 <p id="note" style="margin-top:12px"></p>
 </main>
+<script src="fzstd.js"></script>
 <script>
+// Unpacks a GCPF (Godot zstd) save and walks its body: the sections it holds, and where and how it ends.
+// Shared by the check page (as is) and a Node test.
+function walkSave(u, fzstd) {
+  const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+  const bs = dv.getUint32(8, true), total = dv.getUint32(12, true);
+  const blocks = Math.floor(total / bs) + 1;
+  const out = new Uint8Array(total);
+  let off = 16 + 4 * blocks, w = 0;
+  for (let i = 0; i < blocks; i++) {
+    const cs = dv.getUint32(16 + 4 * i, true);
+    const want = i === blocks - 1 ? total % bs : bs;
+    if (want > 0) {
+      const d = fzstd.decompress(u.subarray(off, off + cs));
+      out.set(d.subarray(0, Math.min(d.length, total - w)), w);
+      w += d.length;
+    }
+    off += cs;
+  }
+  const b = new DataView(out.buffer);
+  const res = { total, unpacked: w, sections: [], end: '' };
+  const magic = String.fromCharCode(out[0], out[1], out[2], out[3]);
+  if (magic !== 'CLSB') { res.end = 'not a save body (starts "' + magic + '")'; return res; }
+  let p = 8;
+  const rec = () => {          // one store_var record: [start of its bytes, its length], or null past the end
+    if (p + 4 > total) return null;
+    const n = b.getUint32(p, true);
+    if (p + 4 + n > total) return [p + 4, n, true];
+    const r = [p + 4, n, false];
+    p += 4 + n;
+    return r;
+  };
+  const head = rec();
+  if (!head || head[2]) { res.end = 'stops inside the header'; return res; }
+  for (;;) {
+    const at = p;
+    const k = rec();
+    if (!k) { res.end = 'stops after ' + (res.sections.length ? res.sections[res.sections.length - 1][0] : 'the header') + ' at byte ' + at + ' of ' + total + ': no end marker'; return res; }
+    if (k[2]) { res.end = 'a section name runs past the end (byte ' + at + ')'; return res; }
+    const type = b.getUint32(k[0], true) & 0xff;
+    if (type !== 4) { res.end = 'byte ' + at + ': expected a section name, found value type ' + type; return res; }
+    const len = b.getUint32(k[0] + 4, true);
+    const key = new TextDecoder().decode(out.subarray(k[0] + 8, k[0] + 8 + len));
+    if (key === '') { res.end = 'ends properly (end marker at byte ' + at + ')'; if (p !== total) res.end += ', with ' + (total - p) + ' bytes after it'; return res; }
+    const v = rec();
+    if (!v) { res.end = 'stops after the name "' + key + '": its value is missing'; return res; }
+    if (v[2]) { res.end = '"' + key + '" says ' + v[1] + ' bytes but only ' + (total - v[0]) + ' are left'; return res; }
+    res.sections.push([key, v[1]]);
+  }
+}
+
 (function () {
   const rows = document.getElementById('rows');
   const note = document.getElementById('note');
@@ -84,13 +139,46 @@ code { font-size: 12px; word-break: break-all; }
       db.close();
       found.sort((a, b) => a[0] < b[0] ? -1 : 1);
       let bad = 0;
+      const looks = [];
       for (const [p, v] of found) {
         const u = v && v.contents ? new Uint8Array(v.contents.buffer || v.contents, v.contents.byteOffset || 0, v.contents.byteLength || v.contents.length) : null;
         const [what, cls] = verdict(u);
         if (cls === 'bad') bad++;
         const when = v && v.timestamp ? new Date(v.timestamp).toLocaleString() : '';
         row([p.replace(PREFIX, ''), u ? (u.length / 1048576).toFixed(2) + ' MB' : '', when, what], cls);
+        if (cls === 'ok') looks.push([p, u, rows.lastChild]);
       }
+      // "Look inside": each whole save unpacked and walked, one at a time, a row under it saying what it holds.
+      const all = document.getElementById('all');
+      const busy = document.getElementById('busy');
+      all.disabled = looks.length === 0 || typeof fzstd === 'undefined';
+      all.onclick = async () => {
+        all.disabled = true;
+        let short = 0;
+        for (let i = 0; i < looks.length; i++) {
+          const [p, u, tr] = looks[i];
+          busy.textContent = 'Unpacking ' + (i + 1) + ' of ' + looks.length + '…';
+          await new Promise((r) => setTimeout(r, 30));
+          let text;
+          try {
+            const r = walkSave(u, fzstd);
+            const big = r.sections.slice().sort((a, b) => b[1] - a[1]).slice(0, 4).map((x) => x[0] + ' ' + (x[1] / 1048576).toFixed(1) + ' MB').join(', ');
+            text = r.sections.length + ' sections (' + big + '). ' + r.end + '.';
+            if (!r.end.startsWith('ends properly')) short++;
+          } catch (e) {
+            text = 'Could not unpack it: ' + (e && e.message ? e.message : e);
+            short++;
+          }
+          const sub = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 4;
+          td.className = 'inside' + (text.includes('ends properly') ? '' : ' bad');
+          td.textContent = '↳ ' + text;
+          sub.appendChild(td);
+          tr.after(sub);
+        }
+        busy.textContent = short ? short + ' save(s) stop early or are damaged inside.' : 'Every save ends properly.';
+      };
       note.textContent = found.length ? (bad ? bad + ' file(s) are damaged.' : 'Every save file is whole.') : 'No saves in this browser for this address.';
     };
     cur.onerror = () => { note.textContent = 'Could not read the saves: ' + (cur.error && cur.error.message); };

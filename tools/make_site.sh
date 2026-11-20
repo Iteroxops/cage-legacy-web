@@ -25,4 +25,5 @@ done
 sed -e "s|__PCK_PARTS__|[${parts%, }]|" -e "s|__WASM_PART__|$wasm|" -e "s|__TOTAL__|$total|" tools/site.html > site/index.html
 cp tools/_headers site/_headers
 cp tools/check.html site/check.html
+cp tools/fzstd.js site/fzstd.js
 ls -l site site/game

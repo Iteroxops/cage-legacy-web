@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Save Check</title>
+<style>
+/* Read-only look at the game's saves in this browser. Dark only, like the game. */
+:root { --bg: #0b0c10; --card: #15171d; --line: #2a2d36; --fg: #e7e4dc; --muted: #9a978f; --good: #7fb27a; --bad: #e0675a; color-scheme: dark; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 24px 16px; }
+main { max-width: 960px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+p { color: var(--muted); margin: 0 0 16px; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ok { color: var(--good); } .bad { color: var(--bad); }
+.wrap { overflow-x: auto; }
+code { font-size: 12px; word-break: break-all; }
+</style>
+</head>
+<body>
+<main>
+<h1>Save check</h1>
+<p>What Cage Legacy has saved in this browser, and whether each file is whole. This page only reads: it changes nothing. Take a screenshot of it.</p>
+<div class="wrap"><table><thead><tr><th>File</th><th>Size</th><th>Saved</th><th>State</th></tr></thead><tbody id="rows"><tr><td colspan="4">Reading…</td></tr></tbody></table></div>
+<p id="note" style="margin-top:12px"></p>
+</main>
+<script>
+(function () {
+  const rows = document.getElementById('rows');
+  const note = document.getElementById('note');
+  const PREFIX = '/userfs/godot/app_userdata/Cage Legacy';
+
+  function verdict(u) {
+    if (!u) return ['folder', ''];
+    const head = u.length >= 4 ? String.fromCharCode(u[0], u[1], u[2], u[3]) : '';
+    if (head !== 'GCPF') return [head === 'CLSB' ? 'binary save' : (head[0] === '{' ? 'JSON' : 'file'), ''];
+    if (u.length < 20) return ['cut off: only ' + u.length + ' bytes', 'bad'];
+    const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+    const bs = dv.getUint32(8, true), total = dv.getUint32(12, true);
+    if (!bs) return ['damaged: block size 0', 'bad'];
+    const blocks = Math.floor(total / bs) + 1;
+    let expected = 16 + 4 * blocks + 4;
+    if (u.length < 16 + 4 * blocks) return ['cut off inside its block table (' + u.length + ' of at least ' + (16 + 4 * blocks) + ' bytes)', 'bad'];
+    for (let i = 0; i < blocks; i++) expected += dv.getUint32(16 + 4 * i, true);
+    const tail = String.fromCharCode(u[u.length - 4], u[u.length - 3], u[u.length - 2], u[u.length - 1]);
+    if (expected !== u.length) return ['wrong size: ' + u.length + ' bytes, its table says ' + expected, 'bad'];
+    if (tail !== 'GCPF') return ['no end marker', 'bad'];
+    return ['whole (' + (total / 1048576).toFixed(1) + ' MB unpacked, block ' + bs + ')', 'ok'];
+  }
+
+  function row(cells, cls) {
+    const tr = document.createElement('tr');
+    cells.forEach((c, i) => {
+      const td = document.createElement('td');
+      if (i === 0) { const code = document.createElement('code'); code.textContent = c; td.appendChild(code); }
+      else td.textContent = c;
+      if (i === 1 || i === 2) td.className = 'num';
+      if (i === 3 && cls) td.className = cls;
+      tr.appendChild(td);
+    });
+    rows.appendChild(tr);
+  }
+
+  let req;
+  try { req = indexedDB.open('/userfs'); } catch (e) { rows.textContent = ''; note.textContent = 'This browser won\'t open its storage here: ' + e.message; return; }
+  req.onerror = () => { rows.textContent = ''; note.textContent = 'Could not open the game\'s storage: ' + (req.error && req.error.message); };
+  req.onsuccess = () => {
+    const db = req.result;
+    rows.textContent = '';
+    if (!db.objectStoreNames.contains('FILE_DATA')) { note.textContent = 'No saves in this browser for this address.'; db.close(); return; }
+    const found = [];
+    const cur = db.transaction(['FILE_DATA'], 'readonly').objectStore('FILE_DATA').openCursor();
+    cur.onsuccess = () => {
+      const c = cur.result;
+      if (c) {
+        const p = String(c.primaryKey);
+        if (p.includes('/saves/')) found.push([p, c.value]);
+        c.continue();
+        return;
+      }
+      db.close();
+      found.sort((a, b) => a[0] < b[0] ? -1 : 1);
+      let bad = 0;
+      for (const [p, v] of found) {
+        const u = v && v.contents ? new Uint8Array(v.contents.buffer || v.contents, v.contents.byteOffset || 0, v.contents.byteLength || v.contents.length) : null;
+        const [what, cls] = verdict(u);
+        if (cls === 'bad') bad++;
+        const when = v && v.timestamp ? new Date(v.timestamp).toLocaleString() : '';
+        row([p.replace(PREFIX, ''), u ? (u.length / 1048576).toFixed(2) + ' MB' : '', when, what], cls);
+      }
+      note.textContent = found.length ? (bad ? bad + ' file(s) are damaged.' : 'Every save file is whole.') : 'No saves in this browser for this address.';
+    };
+    cur.onerror = () => { note.textContent = 'Could not read the saves: ' + (cur.error && cur.error.message); };
+  };
+}());
+</script>
+</body>
+</html>

@@ -1,5 +1,8 @@
+# The game pieces are fetched by fingerprinted addresses (see make_site.sh); the engine's own
+# files keep fixed names, so everything here is checked with the server on each visit (a cheap
+# 304 when unchanged) rather than trusted from the browser's cache.
 /game/*
-  Cache-Control: public, max-age=86400
+  Cache-Control: no-cache
 /
   Cache-Control: no-cache
 /index.html

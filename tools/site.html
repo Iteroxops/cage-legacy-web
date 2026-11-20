@@ -65,7 +65,7 @@ h1 { font-family: var(--display); font-weight: 700; font-size: 44px; line-height
   const saveBox = document.getElementById('save');
   // Gzipped pieces, named .wasm only so the host will serve them; they are read as raw bytes.
   const PCK_PARTS = __PCK_PARTS__;
-  const WASM_PART = 'game/wasm.gz.wasm';
+  const WASM_PART = __WASM_PART__;
   const TOTAL = __TOTAL__;
   // Godot keeps user:// in an IndexedDB database named after this folder, one store of files.
   const USERFS = '/userfs';
@@ -113,7 +113,11 @@ h1 { font-family: var(--display); font-weight: 700; font-size: 44px; line-height
   }
 
   async function gunzip(blob) {
-    return new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).blob();
+    try {
+      return await new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).blob();
+    } catch (e) {
+      throw new Error('The downloaded game files did not unpack (' + (e && e.message ? e.message : e) + '). Reload the page to download them again.');
+    }
   }
 
   async function gzip(blob) {

@@ -11,13 +11,17 @@ tmp=$(mktemp)
 gzip -9 -n -c index.pck > "$tmp"
 split -b 20m -d -a 2 "$tmp" site/game/pck.gz.part
 rm -f "$tmp"
+# Each piece's address carries a fingerprint of its bytes (?v=...), so a browser never mixes
+# pieces of an old build it has cached with a new one: a new build means new addresses.
+ver() { sha256sum "$1" | cut -c1-12; }
 total=$(stat -c %s site/game/wasm.gz.wasm)
+wasm="'game/wasm.gz.wasm?v=$(ver site/game/wasm.gz.wasm)'"
 parts=""
 for f in site/game/pck.gz.part??; do
   mv "$f" "$f.wasm"
-  parts+="'game/$(basename "$f").wasm', "
+  parts+="'game/$(basename "$f").wasm?v=$(ver "$f.wasm")', "
   total=$((total + $(stat -c %s "$f.wasm")))
 done
-sed -e "s|__PCK_PARTS__|[${parts%, }]|" -e "s|__TOTAL__|$total|" tools/site.html > site/index.html
+sed -e "s|__PCK_PARTS__|[${parts%, }]|" -e "s|__WASM_PART__|$wasm|" -e "s|__TOTAL__|$total|" tools/site.html > site/index.html
 cp tools/_headers site/_headers
 ls -l site site/game

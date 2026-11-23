@@ -5,8 +5,10 @@ Play in the browser: https://cage-legacy.pages.dev/ (Cloudflare Pages) or https:
 A single-threaded Godot 4.7.2 web export of Cage Legacy, the MMA career simulator. This repo holds only the
 built game; careers are saved in your browser's storage, on that browser only.
 
-Built from the `web` branch of Iteroxops/cage-legacy (@ 1745bd8) on main @ 27ebe18: WMMA-style play-by-play
-Fight Centre redesign with live vitals, cage position banner, and live fight/round stats (#148), redesigned Clinch
+Built from the `web` branch of Iteroxops/cage-legacy (@ b614976) on main @ 5180d7a: Brand & Ventures empire
+feature (personal brand identity, 5 directions, Brand Equity, representation agencies, sponsor pitching/counters/drops,
+and 7 openable & scalable fighter businesses with Clinch promo, limited drops, stake sales & buyouts, #149), WMMA-style
+play-by-play Fight Centre redesign with live vitals, cage position banner, and live fight/round stats (#148), redesigned Clinch
 social media & fight/brand/campaign promotion (#147), combat sports stage 1 ruleset foundation (#146), Elias Venn's
 Contender Series (EVCS) annual AFL tryout showcase (#145), Sizing Him Up / Fight Night scouting / CoachRead
 aligned with Profile ratings (#144), playtest adjustments (#143: fixed specialist camp & weekly training progression,
